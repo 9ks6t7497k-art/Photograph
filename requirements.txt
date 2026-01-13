@@ -1,0 +1,23 @@
+# Основные зависимости
+python-telegram-bot==20.6
+requests==2.31.0
+python-dotenv==1.0.0
+certifi==2023.11.17
+
+# Для работы с изображениями
+Pillow==10.1.0
+
+# Для работы с временем и датами
+python-dateutil==2.8.2
+
+# Для HTTP запросов
+urllib3==2.1.0
+
+# Для JSON обработки (обычно встроен в Python)
+# json
+
+# Для многопоточности (встроен в Python)
+# threading
+
+# Для работы с файлами (встроен в Python)
+# tempfile, os, io, sys, base64, uuid, datetime, re, logging, time, signal, ssl
