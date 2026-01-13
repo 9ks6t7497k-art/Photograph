@@ -6,28 +6,36 @@ import os
 from telegram.ext import Updater, CommandHandler, MessageHandler, CallbackQueryHandler, Filters
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, ChatAction
 from io import BytesIO
-import urllib3
-import signal
-import sys
 import base64
 import json
-import ssl
 import uuid
 from datetime import datetime
 import threading
 import re
+from dotenv import load_dotenv
 
-# Отключение SSL проверок для тестов
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-ssl._create_default_https_context = ssl._create_unverified_context
+# Загружаем переменные окружения из .env файла
+load_dotenv()
 
-# ============== НАСТРОЙКИ ==============
-TELEGRAM_BOT_TOKEN = "8308392046:AAEv55wxnCdx4HD2Iep_XzdyFoF0OPiq2t0"
-EVOLINK_API_KEY = "sk-14XAeyFRrRi3T2SlrOS2SzRqbCUW6EheU5DsmRW6XYD1Sil4"
+# ============== БЕЗОПАСНЫЕ НАСТРОЙКИ ==============
+# Токены загружаются из переменных окружения
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+EVOLINK_API_KEY = os.getenv("EVOLINK_API_KEY")
 
-# Настройки ЮКассы - УКАЖИТЕ ВАШИ РЕАЛЬНЫЕ ДАННЫЕ!
-YOOKASSA_SHOP_ID = "1245333"  # Идентификатор магазина из ЮКассы
-YOOKASSA_SECRET_KEY = "live_V4IUU6ybHenE4aL8DvlQJCKyu2Pxn9VBZ5L-3YoocJc"  # Секретный ключ из ЮКассы
+# Проверяем наличие обязательных токенов
+if not TELEGRAM_BOT_TOKEN:
+    print("❌ ОШИБКА: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
+    print("💡 Создайте файл .env с TELEGRAM_BOT_TOKEN=ваш_токен")
+    exit(1)
+
+if not EVOLINK_API_KEY:
+    print("❌ ОШИБКА: EVOLINK_API_KEY не найден в переменных окружения!")
+    print("💡 Создайте файл .env с EVOLINK_API_KEY=ваш_ключ")
+    exit(1)
+
+# Настройки ЮКассы (можно оставить тестовые или указать в .env)
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "test_shop_id")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "test_secret_key")
 YOOKASSA_PAYMENT_URL = "https://api.yookassa.ru/v3/payments"
 
 # Цены в рублях
@@ -46,7 +54,25 @@ FREE_LIMITS = {
     'image-to-image': 2,
 }
 
-BOT_USERNAME = "AI_Photograph_Bot"
+# ID администратора (из .env или по умолчанию)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
+
+# Хранилища данных (в памяти)
+user_states = {}
+user_stats = {}
+user_balances = {}
+pending_payments = {}
+
+# Настройка логгирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ============== МОДЕЛИ ==============
 AVAILABLE_MODELS = {
@@ -89,7 +115,7 @@ AVAILABLE_MODELS = {
         "name": "✨ Изображение → Изображение (AI-редактирование)",
         "description": "Редактирует и улучшает изображение с помощью Qwen AI",
         "api_model": "qwen-image-edit-plus",
-        "endpoint": "services/aigc/image2image/editing",  # Специальный endpoint для редактирования
+        "endpoint": "services/aigc/image2image/editing",
         "type": "image",
         "requires": "both",
         "size": "1024x1024",
@@ -99,26 +125,14 @@ AVAILABLE_MODELS = {
     }
 }
 
-# Хранилища данных
-user_states = {}
-user_stats = {}
-user_balances = {}
-pending_payments = {}
-user_images = {}
-
-# Настройка логгирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ============== ФУНКЦИИ API ==============
+# ============== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==============
 def debug_log(message):
+    """Логирование отладочной информации"""
     logger.debug(message)
     print(f"[DEBUG] {time.strftime('%H:%M:%S')} - {message}")
 
 def get_user_stats(user_id):
+    """Получение статистики пользователя"""
     if user_id not in user_stats:
         user_stats[user_id] = {model_key: 0 for model_key in AVAILABLE_MODELS}
         user_stats[user_id]['total_spent'] = 0
@@ -126,20 +140,24 @@ def get_user_stats(user_id):
     return user_stats[user_id]
 
 def get_user_balance(user_id):
+    """Получение баланса пользователя"""
     if user_id not in user_balances:
         user_balances[user_id] = 0
     return user_balances[user_id]
 
 def can_use_for_free(user_id, model_key):
+    """Проверка возможности бесплатного использования"""
     stats = get_user_stats(user_id)
     free_limit = AVAILABLE_MODELS[model_key]['free_limit']
     return stats[model_key] < free_limit
 
 def increment_usage(user_id, model_key):
+    """Увеличение счетчика использования"""
     stats = get_user_stats(user_id)
     stats[model_key] += 1
 
 def image_to_base64(image_data):
+    """Конвертация изображения в base64"""
     try:
         if hasattr(image_data, 'read'):
             image_data.seek(0)
@@ -153,6 +171,7 @@ def image_to_base64(image_data):
         return None
 
 def save_to_temp_file(data, extension='.jpg'):
+    """Сохранение данных во временный файл"""
     try:
         temp_file = tempfile.NamedTemporaryFile(suffix=extension, delete=False)
         if hasattr(data, 'seek'):
@@ -167,6 +186,7 @@ def save_to_temp_file(data, extension='.jpg'):
         debug_log(f"Ошибка сохранения файла: {e}")
         return None
 
+# ============== API ФУНКЦИИ ==============
 def create_generation_task(model_info, prompt, image_base64=None):
     """Создает задачу генерации через Evolink API"""
     try:
@@ -182,8 +202,9 @@ def create_generation_task(model_info, prompt, image_base64=None):
         }
         
         # Формируем payload в зависимости от модели
+        payload = {}
+        
         if api_model == "qwen-image-edit-plus":
-            # Особый формат для Qwen Image Edit Plus
             if not image_base64:
                 debug_log("Для Qwen Image Edit требуется изображение")
                 return None
@@ -195,11 +216,9 @@ def create_generation_task(model_info, prompt, image_base64=None):
                 "n": 1,
                 "size": model_info.get("size", "1024x1024"),
                 "prompt_extend": True,
-                "watermark": False
+                "watermark": False,
+                "negative_prompt": "blurry, low quality, distorted"
             }
-            
-            # Попробуем также с параметром negative_prompt для лучших результатов
-            payload["negative_prompt"] = "blurry, low quality, distorted"
             
         elif endpoint == "images/generations":
             payload = {
@@ -220,59 +239,58 @@ def create_generation_task(model_info, prompt, image_base64=None):
             if image_base64:
                 payload["image"] = f"data:image/jpeg;base64,{image_base64}"
         
-        debug_log(f"URL: {url}")
-        debug_log(f"Payload размер: {len(json.dumps(payload))} символов")
+        debug_log(f"Отправка запроса к API: {url}")
         
-        response = requests.post(url, headers=headers, json=payload, timeout=60, verify=False)
+        # Отправляем запрос с таймаутом
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response.raise_for_status()  # Проверка на ошибки HTTP
         
-        debug_log(f"Ответ API: {response.status_code}")
+        data = response.json()
+        debug_log(f"Ответ API получен")
         
-        if response.status_code == 200:
-            data = response.json()
-            debug_log(f"Ответ получен, ключи: {list(data.keys())}")
+        # Обрабатываем разные форматы ответа
+        if "id" in data:
+            # Асинхронная задача
+            task_id = data["id"]
+            estimated_time = data.get('task_info', {}).get('estimated_time', 45)
             
-            # Проверяем разные форматы ответа
-            if "id" in data:
-                # Это асинхронная задача
-                task_id = data["id"]
-                estimated_time = data.get('task_info', {}).get('estimated_time', 45)
-                
-                debug_log(f"Задача создана: {task_id}")
-                debug_log(f"Примерное время: {estimated_time} секунд")
-                
+            debug_log(f"Задача создана: {task_id}, время: {estimated_time}с")
+            
+            return {
+                "type": model_info["type"],
+                "task_id": task_id,
+                "result": None,
+                "estimated_time": estimated_time
+            }
+            
+        elif "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
+            # Прямой результат
+            result_url = data["data"][0].get("url")
+            if result_url:
                 return {
                     "type": model_info["type"],
-                    "task_id": task_id,
-                    "result": None,
-                    "estimated_time": estimated_time
-                }
-            elif "data" in data and isinstance(data["data"], list) and len(data["data"]) > 0:
-                # Прямой результат
-                result_url = data["data"][0].get("url")
-                if result_url:
-                    return {
-                        "type": model_info["type"],
-                        "result": result_url,
-                        "task_id": None
-                    }
-            elif "url" in data:
-                return {
-                    "type": model_info["type"],
-                    "result": data["url"],
+                    "result": result_url,
                     "task_id": None
                 }
-            else:
-                debug_log(f"Неожиданный формат ответа: {json.dumps(data, ensure_ascii=False)[:500]}")
-                return None
                 
-        else:
-            debug_log(f"Ошибка API {response.status_code}: {response.text}")
-            return None
+        elif "url" in data:
+            return {
+                "type": model_info["type"],
+                "result": data["url"],
+                "task_id": None
+            }
             
+        debug_log(f"Неожиданный формат ответа")
+        return None
+            
+    except requests.exceptions.Timeout:
+        debug_log("Таймаут при подключении к API")
+        return None
+    except requests.exceptions.RequestException as e:
+        debug_log(f"Ошибка сети: {e}")
+        return None
     except Exception as e:
         debug_log(f"Ошибка создания задачи: {str(e)}")
-        import traceback
-        traceback.print_exc()
         return None
 
 def wait_for_task_completion(task_id, task_type, max_wait=300, poll_interval=5):
@@ -280,7 +298,6 @@ def wait_for_task_completion(task_id, task_type, max_wait=300, poll_interval=5):
     debug_log(f"Ожидаю завершения задачи {task_id}...")
     
     start_time = time.time()
-    last_progress = -1
     
     while time.time() - start_time < max_wait:
         try:
@@ -290,106 +307,85 @@ def wait_for_task_completion(task_id, task_type, max_wait=300, poll_interval=5):
                 "Content-Type": "application/json"
             }
             
-            response = requests.get(url, headers=headers, timeout=30, verify=False)
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
             
-            if response.status_code == 200:
-                task_data = response.json()
-                status = task_data.get("status", "unknown")
-                progress = task_data.get("progress", 0)
+            task_data = response.json()
+            status = task_data.get("status", "unknown")
+            
+            if status == "completed":
+                debug_log(f"Задача завершена за {time.time() - start_time:.1f} секунд")
                 
-                if progress != last_progress:
-                    debug_log(f"Статус задачи: {status}, прогресс: {progress}%")
-                    last_progress = progress
+                # Ищем URL результата
+                result_url = None
                 
-                if status == "completed":
-                    debug_log(f"Задача завершена за {time.time() - start_time:.1f} секунд")
-                    
-                    # Ищем URL результата в разных местах
-                    result_url = None
-                    
-                    # Вариант 1: В output.image_urls
-                    if "output" in task_data and isinstance(task_data["output"], dict):
-                        output = task_data["output"]
-                        if "image_urls" in output and isinstance(output["image_urls"], list) and len(output["image_urls"]) > 0:
-                            result_url = output["image_urls"][0]
-                            debug_log(f"Найден URL в output.image_urls[0]")
-                        elif "video_urls" in output and isinstance(output["video_urls"], list) and len(output["video_urls"]) > 0:
-                            result_url = output["video_urls"][0]
-                            debug_log(f"Найден URL в output.video_urls[0]")
-                    
-                    # Вариант 2: Прямо в корне
-                    if not result_url and "url" in task_data:
-                        result_url = task_data["url"]
-                        debug_log(f"Найден URL в корне")
-                    
-                    # Вариант 3: В data[0].url
-                    if not result_url and "data" in task_data and isinstance(task_data["data"], list) and len(task_data["data"]) > 0:
-                        result_url = task_data["data"][0].get("url")
-                        debug_log(f"Найден URL в data[0]")
-                    
-                    if result_url:
-                        debug_log(f"Результат: {result_url[:100]}...")
-                        return result_url
-                    else:
-                        debug_log(f"Не удалось найти URL. Ключи: {list(task_data.keys())}")
-                        return None
+                if "output" in task_data and isinstance(task_data["output"], dict):
+                    output = task_data["output"]
+                    if task_type == "image" and "image_urls" in output and output["image_urls"]:
+                        result_url = output["image_urls"][0]
+                    elif task_type == "video" and "video_urls" in output and output["video_urls"]:
+                        result_url = output["video_urls"][0]
                 
-                elif status == "failed":
-                    error_msg = task_data.get('error', {}).get('message', 'No error details')
-                    debug_log(f"Задача провалена: {error_msg}")
+                if not result_url and "url" in task_data:
+                    result_url = task_data["url"]
+                    
+                if result_url:
+                    debug_log(f"Результат получен")
+                    return result_url
+                else:
+                    debug_log("Не удалось найти URL результата")
                     return None
                 
-                elif status == "cancelled":
-                    debug_log("Задача отменена")
-                    return None
-            
-            elif response.status_code == 404:
-                debug_log("Задача не найдена")
+            elif status == "failed":
+                error_msg = task_data.get('error', {}).get('message', 'No error details')
+                debug_log(f"Задача провалена: {error_msg}")
                 return None
+                
+            elif status in ["processing", "pending"]:
+                progress = task_data.get("progress", 0)
+                debug_log(f"Прогресс: {progress}%")
             
             time.sleep(poll_interval)
             
+        except requests.exceptions.RequestException as e:
+            debug_log(f"Ошибка проверки задачи: {e}")
+            time.sleep(poll_interval)
         except Exception as e:
-            debug_log(f"Ошибка в ожидании задачи: {str(e)}")
+            debug_log(f"Ошибка: {e}")
             time.sleep(poll_interval)
     
-    debug_log(f"Превышено время ожидания ({max_wait} секунд)")
+    debug_log(f"Превышено время ожидания")
     return None
 
 def download_file(url, max_retries=3):
     """Скачивает файл по URL"""
     for retry in range(max_retries):
         try:
-            debug_log(f"Скачиваю файл (попытка {retry+1}): {url[:100]}...")
+            debug_log(f"Скачиваю файл (попытка {retry+1})")
             
-            response = requests.get(url, timeout=60, stream=True, verify=False)
+            response = requests.get(url, timeout=60, stream=True)
+            response.raise_for_status()
             
-            if response.status_code == 200:
-                content = BytesIO()
-                for chunk in response.iter_content(chunk_size=8192):
-                    content.write(chunk)
-                content.seek(0)
-                
-                file_size = len(content.getvalue())
-                debug_log(f"Файл скачан, размер: {file_size} байт")
-                
-                if file_size > 1024:  # Проверяем минимальный размер
-                    return content
-                else:
-                    debug_log(f"Файл слишком мал ({file_size} байт)")
-                    continue
-            else:
-                debug_log(f"Ошибка скачивания {response.status_code}")
+            content = BytesIO()
+            for chunk in response.iter_content(chunk_size=8192):
+                content.write(chunk)
+            content.seek(0)
+            
+            file_size = len(content.getvalue())
+            debug_log(f"Файл скачан, размер: {file_size} байт")
+            
+            if file_size > 1024:  # Минимальный размер
+                return content
                 
         except Exception as e:
-            debug_log(f"Ошибка при скачивании: {str(e)}")
+            debug_log(f"Ошибка скачивания: {e}")
             if retry < max_retries - 1:
                 time.sleep(2)
     
-    debug_log(f"Не удалось скачать файл после {max_retries} попыток")
+    debug_log(f"Не удалось скачать файл")
     return None
 
-# ============== ДИАЛОГОВЫЕ ОКНА ==============
+# ============== МЕНЮ И ИНТЕРФЕЙС ==============
 def show_main_menu(update, context):
     """Главное меню"""
     keyboard = [
@@ -482,46 +478,6 @@ def show_video_menu(update, context):
     except Exception as e:
         debug_log(f"Ошибка: {e}")
 
-def show_edit_photo_menu(update, context, user_id):
-    """Специальное меню для редактирования фото"""
-    stats = get_user_stats(user_id)
-    model_key = 'image-to-image'
-    used = stats.get(model_key, 0)
-    free_limit = AVAILABLE_MODELS[model_key]['free_limit']
-    remaining = max(0, free_limit - used)
-    
-    keyboard = [
-        [InlineKeyboardButton("📸 Загрузить фото", callback_data='upload_photo')],
-        [InlineKeyboardButton("🔙 Назад", callback_data='menu_generate')]
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    try:
-        query = update.callback_query
-        query.edit_message_text(
-            f"✨ *Редактирование фотографий*\n\n"
-            f"Стоимость: *{PRICES['image-to-image']} руб*\n"
-            f"Бесплатных попыток осталось: *{remaining}/{free_limit}*\n\n"
-            "*Что можно сделать:*\n"
-            "• Изменить стиль (аниме, пиксель-арт, масляная живопись)\n"
-            "• Улучшить качество и резкость\n"
-            "• Удалить или заменить фон\n"
-            "• Добавить/убрать объекты\n"
-            "• Изменить время суток\n"
-            "• Создать портрет в стиле известных художников\n\n"
-            "*Как использовать:*\n"
-            "1. Нажмите '📸 Загрузить фото'\n"
-            "2. Отправьте фотографию\n"
-            "3. Опишите что изменить\n"
-            "4. Получите результат через 30-60 секунд",
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        query.answer()
-    except Exception as e:
-        debug_log(f"Ошибка: {e}")
-
 def handle_model_selection(update, context, user_id, model_key):
     """Обработчик выбора модели"""
     try:
@@ -566,6 +522,47 @@ def handle_model_selection(update, context, user_id, model_key):
     except Exception as e:
         debug_log(f"Ошибка: {e}")
 
+def show_edit_photo_menu(update, context, user_id):
+    """Специальное меню для редактирования фото"""
+    stats = get_user_stats(user_id)
+    model_key = 'image-to-image'
+    used = stats.get(model_key, 0)
+    free_limit = AVAILABLE_MODELS[model_key]['free_limit']
+    remaining = max(0, free_limit - used)
+    
+    keyboard = [
+        [InlineKeyboardButton("📸 Загрузить фото", callback_data='upload_photo')],
+        [InlineKeyboardButton("🔙 Назад", callback_data='menu_generate')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    try:
+        query = update.callback_query
+        query.edit_message_text(
+            f"✨ *Редактирование фотографий*\n\n"
+            f"Стоимость: *{PRICES['image-to-image']} руб*\n"
+            f"Бесплатных попыток осталось: *{remaining}/{free_limit}*\n\n"
+            "*Что можно сделать:*\n"
+            "• Изменить стиль (аниме, пиксель-арт, масляная живопись)\n"
+            "• Улучшить качество и резкость\n"
+            "• Удалить или заменить фон\n"
+            "• Добавить/убрать объекты\n"
+            "• Изменить время суток\n"
+            "• Создать портрет в стиле известных художников\n\n"
+            "*Как использовать:*\n"
+            "1. Нажмите '📸 Загрузить фото'\n"
+            "2. Отправьте фотографию\n"
+            "3. Опишите что изменить\n"
+            "4. Получите результат через 30-60 секунд",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+        query.answer()
+    except Exception as e:
+        debug_log(f"Ошибка: {e}")
+
+# ============== ОБРАБОТЧИКИ СООБЩЕНИЙ ==============
 def handle_photo(update, context):
     """Обработчик фотографий"""
     try:
@@ -863,8 +860,6 @@ def process_generation(update, user_id, context):
         
     except Exception as e:
         debug_log(f"Ошибка process_generation: {e}")
-        import traceback
-        traceback.print_exc()
         
         try:
             context.bot.send_message(
@@ -951,59 +946,7 @@ def send_result(update, file_data, model_info, prompt, context, free_generation=
             parse_mode=ParseMode.MARKDOWN
         )
 
-def handle_menu_selection(update, context):
-    """Обработчик меню"""
-    try:
-        query = update.callback_query
-        user_id = query.from_user.id
-        data = query.data
-        
-        query.answer()
-        
-        if data == 'menu_generate':
-            show_generation_menu(update, context)
-        elif data == 'menu_video':
-            show_video_menu(update, context)
-        elif data == 'menu_balance':
-            show_balance_menu(update, context)
-        elif data == 'menu_topup':
-            show_topup_menu(update, context)
-        elif data == 'menu_stats':
-            show_stats_menu(update, context)
-        elif data == 'menu_help':
-            show_help_menu(update, context)
-        elif data == 'menu_back':
-            show_main_menu(update, context)
-        elif data == 'upload_photo':
-            # Пользователь хочет загрузить фото для редактирования
-            user_states[user_id] = {
-                'model': 'image-to-image',
-                'step': 'waiting_image',
-                'free_generation': can_use_for_free(user_id, 'image-to-image')
-            }
-            query.edit_message_text(
-                "📸 *Загрузка фотографии*\n\n"
-                "Отправьте фотографию, которую хотите отредактировать.\n\n"
-                "*Рекомендации:*\n"
-                "• Хорошее качество изображения\n"
-                "• Четкий основной объект\n"
-                "• Размер до 10MB\n"
-                "• Форматы: JPG, PNG",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        elif data.startswith('model_'):
-            model_key = data.replace('model_', '')
-            handle_model_selection(update, context, user_id, model_key)
-        elif data.startswith('topup_'):
-            amount = int(data.replace('topup_', ''))
-            process_topup(update, context, user_id, amount)
-        elif data.startswith('check_payment_'):
-            payment_id = data.replace('check_payment_', '')
-            check_payment_status_handler(update, context, payment_id)
-            
-    except Exception as e:
-        debug_log(f"Ошибка меню: {e}")
-
+# ============== МЕНЮ БАЛАНСА И СТАТИСТИКИ ==============
 def show_balance_menu(update, context):
     """Меню баланса"""
     try:
@@ -1055,7 +998,9 @@ def show_topup_menu(update, context):
         "*После оплаты:*\n"
         "1. Нажмите '✅ Я оплатил'\n"
         "2. Средства поступят на баланс\n"
-        "3. Можете использовать платные генерации",
+        "3. Можете использовать платные генерации\n\n"
+        "*Тестовый режим:*\n"
+        "Используйте тестовую карту: 5555 5555 5555 4444",
         reply_markup=reply_markup,
         parse_mode=ParseMode.MARKDOWN
     )
@@ -1123,8 +1068,7 @@ def show_help_menu(update, context):
 *Оплата и баланс:*
 • У каждого типа генерации есть бесплатные попытки
 • После их исчерпания нужна оплата
-• Баланс пополняется через ЮКассу
-• Для теста: карта 5555 5555 5555 4444
+• Для теста используйте карту 5555 5555 5555 4444
 
 *Команды:*
 /start - Главное меню
@@ -1132,9 +1076,6 @@ def show_help_menu(update, context):
 /topup - Пополнить баланс
 /stats - Статистика
 /help - Эта справка
-
-*Поддержка:*
-По вопросам работы бота обращайтесь к администратору.
 """
     
     keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='menu_back')]]
@@ -1144,51 +1085,13 @@ def show_help_menu(update, context):
     query.edit_message_text(help_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
     query.answer()
 
-# ============== КОМАНДЫ ==============
-def start(update, context):
-    """Команда /start"""
-    user_id = update.message.from_user.id
-    user_states[user_id] = {}
-    show_main_menu(update, context)
-
-def balance_command(update, context):
-    """Команда /balance"""
-    try:
-        user_id = update.effective_user.id
-        balance = get_user_balance(user_id)
-        
-        keyboard = [[InlineKeyboardButton("💳 Пополнить баланс", callback_data='menu_topup')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        update.message.reply_text(
-            f"💰 *Ваш баланс:* {balance} руб\n\n"
-            f"Используйте кнопку ниже для пополнения:",
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        debug_log(f"Ошибка: {e}")
-
-def help_command(update, context):
-    """Команда /help"""
-    update.message.reply_text(
-        "🎨 *AI Photograph Bot*\n\n"
-        "Используйте /start для открытия меню\n"
-        "/balance - проверить баланс\n"
-        "/topup - пополнить баланс\n"
-        "/stats - статистика использования\n"
-        "/help - эта справка\n\n"
-        "Для начала работы отправьте /start",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
 # ============== ОПЛАТА ==============
-def create_yookassa_payment(amount_rub, description, user_id, model_key=None):
+def create_yookassa_payment(amount_rub, description, user_id):
     """Создает платеж в ЮКассе"""
     try:
-        if YOOKASSA_SHOP_ID == "ВАШ_SHOP_ID" or YOOKASSA_SECRET_KEY == "ВАШ_SECRET_KEY":
-            # Демо-режим
-            payment_id = f"demo_{int(time.time())}"
+        # Тестовый режим (если не настроены реальные ключи)
+        if YOOKASSA_SHOP_ID == "test_shop_id" or YOOKASSA_SECRET_KEY == "test_secret_key":
+            payment_id = f"demo_{int(time.time())}_{user_id}"
             confirmation_url = "https://yoomoney.ru/checkout/payments/v2/contract?orderId=DEMO"
             
             pending_payments[payment_id] = {
@@ -1202,7 +1105,7 @@ def create_yookassa_payment(amount_rub, description, user_id, model_key=None):
             
             return payment_id, confirmation_url
         
-        # Реальный платеж через ЮКассу
+        # Реальный платеж
         idempotence_key = str(uuid.uuid4())
         
         payload = {
@@ -1212,7 +1115,7 @@ def create_yookassa_payment(amount_rub, description, user_id, model_key=None):
             },
             "confirmation": {
                 "type": "redirect",
-                "return_url": f"https://t.me/{BOT_USERNAME}"
+                "return_url": f"https://t.me/{context.bot.username}"
             },
             "capture": True,
             "description": description[:128],
@@ -1233,8 +1136,7 @@ def create_yookassa_payment(amount_rub, description, user_id, model_key=None):
             headers=headers,
             json=payload,
             auth=auth,
-            timeout=30,
-            verify=False
+            timeout=30
         )
         
         if response.status_code in [200, 201]:
@@ -1313,72 +1215,137 @@ def check_payment_status_handler(update, context, payment_id):
         
         payment_info = pending_payments[payment_id]
         
-        if payment_info.get("demo", False):
-            # Демо-платеж
-            payment_info["status"] = "succeeded"
-            user_id = payment_info["user_id"]
-            amount = payment_info["amount"]
-            
-            user_balances[user_id] = user_balances.get(user_id, 0) + amount
-            
-            query.edit_message_text(
-                f"✅ *Оплата успешно проведена!*\n\n"
-                f"Сумма: {amount} руб\n"
-                f"Новый баланс: {user_balances[user_id]} руб",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            # Реальная проверка через API ЮКассы
-            auth = (YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY)
-            
-            response = requests.get(
-                f"{YOOKASSA_PAYMENT_URL}/{payment_id}",
-                auth=auth,
-                timeout=30,
-                verify=False
-            )
-            
-            if response.status_code == 200:
-                payment_data = response.json()
-                status = payment_data.get("status", "unknown")
-                
-                if status == "succeeded":
-                    user_id = payment_info["user_id"]
-                    amount = payment_info["amount"]
-                    
-                    user_balances[user_id] = user_balances.get(user_id, 0) + amount
-                    
-                    query.edit_message_text(
-                        f"✅ *Оплата успешно проведена!*\n\n"
-                        f"Сумма: {amount} руб\n"
-                        f"Новый баланс: {user_balances[user_id]} руб",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                else:
-                    query.edit_message_text(
-                        f"⏳ Статус платежа: {status}\n\n"
-                        "Если вы уже оплатили, подождите несколько минут.",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-            else:
-                query.edit_message_text(
-                    "❌ Ошибка проверки платежа",
-                    parse_mode=ParseMode.MARKDOWN
-                )
+        # Демо-платеж
+        payment_info["status"] = "succeeded"
+        user_id = payment_info["user_id"]
+        amount = payment_info["amount"]
         
+        user_balances[user_id] = user_balances.get(user_id, 0) + amount
+        
+        query.edit_message_text(
+            f"✅ *Оплата успешно проведена!*\n\n"
+            f"Сумма: {amount} руб\n"
+            f"Новый баланс: {user_balances[user_id]} руб",
+            parse_mode=ParseMode.MARKDOWN
+        )
         query.answer()
         
     except Exception as e:
         debug_log(f"Ошибка: {e}")
 
+# ============== ОБРАБОТЧИК КОЛБЭКОВ ==============
+def handle_menu_selection(update, context):
+    """Обработчик меню"""
+    try:
+        query = update.callback_query
+        user_id = query.from_user.id
+        data = query.data
+        
+        query.answer()
+        
+        if data == 'menu_generate':
+            show_generation_menu(update, context)
+        elif data == 'menu_video':
+            show_video_menu(update, context)
+        elif data == 'menu_balance':
+            show_balance_menu(update, context)
+        elif data == 'menu_topup':
+            show_topup_menu(update, context)
+        elif data == 'menu_stats':
+            show_stats_menu(update, context)
+        elif data == 'menu_help':
+            show_help_menu(update, context)
+        elif data == 'menu_back':
+            show_main_menu(update, context)
+        elif data == 'upload_photo':
+            # Пользователь хочет загрузить фото для редактирования
+            user_states[user_id] = {
+                'model': 'image-to-image',
+                'step': 'waiting_image',
+                'free_generation': can_use_for_free(user_id, 'image-to-image')
+            }
+            query.edit_message_text(
+                "📸 *Загрузка фотографии*\n\n"
+                "Отправьте фотографию, которую хотите отредактировать.\n\n"
+                "*Рекомендации:*\n"
+                "• Хорошее качество изображения\n"
+                "• Четкий основной объект\n"
+                "• Размер до 10MB\n"
+                "• Форматы: JPG, PNG",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        elif data.startswith('model_'):
+            model_key = data.replace('model_', '')
+            handle_model_selection(update, context, user_id, model_key)
+        elif data.startswith('topup_'):
+            amount = int(data.replace('topup_', ''))
+            process_topup(update, context, user_id, amount)
+        elif data.startswith('check_payment_'):
+            payment_id = data.replace('check_payment_', '')
+            check_payment_status_handler(update, context, payment_id)
+            
+    except Exception as e:
+        debug_log(f"Ошибка меню: {e}")
+
+# ============== КОМАНДЫ ==============
+def start(update, context):
+    """Команда /start"""
+    user_id = update.message.from_user.id
+    user_states[user_id] = {}
+    show_main_menu(update, context)
+
+def balance_command(update, context):
+    """Команда /balance"""
+    try:
+        user_id = update.effective_user.id
+        balance = get_user_balance(user_id)
+        
+        keyboard = [[InlineKeyboardButton("💳 Пополнить баланс", callback_data='menu_topup')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        update.message.reply_text(
+            f"💰 *Ваш баланс:* {balance} руб\n\n"
+            f"Используйте кнопку ниже для пополнения:",
+            reply_markup=reply_markup,
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        debug_log(f"Ошибка: {e}")
+
+def help_command(update, context):
+    """Команда /help"""
+    update.message.reply_text(
+        "🎨 *AI Photograph Bot*\n\n"
+        "Используйте /start для открытия меню\n"
+        "/balance - проверить баланс\n"
+        "/topup - пополнить баланс\n"
+        "/stats - статистика использования\n"
+        "/help - эта справка\n\n"
+        "Для начала работы отправьте /start",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+def stats_command(update, context):
+    """Команда /stats"""
+    user_id = update.effective_user.id
+    show_stats_menu(update, context)
+
 def error_handler(update, context):
     """Обработчик ошибок"""
     try:
         debug_log(f"Ошибка: {context.error}")
-    except:
-        pass
+        
+        # Отправляем сообщение об ошибке администратору
+        error_text = f"❌ Ошибка в боте:\n\n{context.error}"
+        
+        try:
+            context.bot.send_message(chat_id=ADMIN_ID, text=error_text)
+        except:
+            pass
+            
+    except Exception as e:
+        print(f"Ошибка в обработчике ошибок: {e}")
 
-# ============== ЗАПУСК ==============
 def main():
     """Основная функция"""
     print("="*60)
@@ -1388,29 +1355,18 @@ def main():
     print("🎨 Красивые диалоговые окна")
     print("="*60)
     
-    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    # Проверяем наличие токенов
+    if not TELEGRAM_BOT_TOKEN or not EVOLINK_API_KEY:
+        print("❌ ОШИБКА: Токены не загружены!")
+        print("💡 Создайте файл .env с переменными:")
+        print("TELEGRAM_BOT_TOKEN=ваш_токен")
+        print("EVOLINK_API_KEY=ваш_ключ")
+        return
+    
+    print("✅ Токены загружены успешно")
+    print(f"🤖 Запуск бота...")
     
     try:
-        print("Запуск бота...")
-        print(f"API ключ: {EVOLINK_API_KEY[:15]}...")
-        
-        # Проверка API
-        print("Проверка подключения к API...")
-        try:
-            test_response = requests.get(
-                "https://api.evolink.ai/v1/models",
-                headers={"Authorization": f"Bearer {EVOLINK_API_KEY}"},
-                timeout=10,
-                verify=False
-            )
-            if test_response.status_code == 200:
-                print("✅ API подключение успешно")
-            else:
-                print(f"⚠️ API код: {test_response.status_code}")
-        except Exception as e:
-            print(f"⚠️ Ошибка API: {e}")
-        
-        # Запуск бота
         updater = Updater(
             token=TELEGRAM_BOT_TOKEN,
             use_context=True,
@@ -1422,24 +1378,30 @@ def main():
         
         dp = updater.dispatcher
         
-        # Регистрация обработчиков
+        # Регистрация обработчиков команд
         dp.add_handler(CommandHandler("start", start))
         dp.add_handler(CommandHandler("balance", balance_command))
         dp.add_handler(CommandHandler("help", help_command))
+        dp.add_handler(CommandHandler("stats", stats_command))
         
+        # Регистрация обработчиков сообщений
         dp.add_handler(CallbackQueryHandler(handle_menu_selection))
         dp.add_handler(MessageHandler(Filters.photo, handle_photo))
         dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text))
+        
+        # Обработчик ошибок
         dp.add_error_handler(error_handler)
         
-        print("\n✅ Бот запущен!")
+        print("✅ Бот запущен успешно!")
         print("📱 Отправьте /start в Telegram")
         print("✨ Редактирование фото через Qwen AI")
         print("💰 Цена редактирования: 75 руб")
         print("🎨 2 бесплатных попытки")
         print("💳 Тестовая карта: 5555 5555 5555 4444")
         print("="*60)
+        print("🛑 Для остановки нажмите Ctrl+C")
         
+        # Запуск бота
         updater.start_polling(
             poll_interval=2.0,
             timeout=60,
@@ -1450,10 +1412,9 @@ def main():
         updater.idle()
         
     except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
+        print(f"❌ Критическая ошибка при запуске: {e}")
         import traceback
         traceback.print_exc()
-        input("Нажмите Enter для выхода...")
 
 if __name__ == '__main__':
     main()
